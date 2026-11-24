@@ -1,21 +1,37 @@
 #!/usr/bin/env bash
-# SmartCCTV 交互式菜单：检测 / 修复 / 运行 / 维护 / 测试 / 帮助
+# SmartCCTV 交互菜单：启动 / 运维 / 环境检测（选中后清屏覆盖刷新）
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 PID_FILE="$ROOT/data/smartcctv.pid"
 LOG_FILE="$ROOT/data/logs/smartcctv.log"
+COMPOSE_FILE="$ROOT/docker-compose.yml"
 YES=0
 CI=0
 
 for arg in "$@"; do
   case "$arg" in
-    --yes) YES=1 ;;
+    --yes|-y) YES=1 ;;
     --ci) CI=1; YES=1 ;;
   esac
 done
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+clear_screen() {
+  # 覆盖刷新：清屏并回顶；非 TTY / CI 不刷
+  if [[ -t 1 && "$CI" -eq 0 ]]; then
+    printf '\033[H\033[2J'
+  fi
+}
+
+pause_back() {
+  if [[ "$CI" -eq 1 || "$YES" -eq 1 ]]; then
+    return 0
+  fi
+  echo
+  read -r -p "按回车返回菜单… " _
+}
 
 ensure_dirs() {
   mkdir -p "$ROOT/data/"{db,secrets,recordings,snapshots,thumbs,logs,s3} "$ROOT/models"
@@ -28,19 +44,29 @@ copy_config() {
   fi
 }
 
+# ---------- 环境 ----------
 cmd_diagnose() {
   echo "=== 环境检测 ==="
   local fail=0
-  have uv && echo "[OK] uv $(uv --version)" || { echo "[FAIL] uv"; fail=1; }
+  have uv && echo "[OK] uv $(uv --version 2>/dev/null | head -1)" || { echo "[FAIL] uv"; fail=1; }
   have ffmpeg && echo "[OK] ffmpeg" || { echo "[FAIL] ffmpeg"; fail=1; }
   have ffprobe && echo "[OK] ffprobe" || { echo "[WARN] ffprobe"; }
+  have docker && echo "[OK] docker" || echo "[WARN] docker（Docker 启动模式不可用）"
+  have docker-compose || have docker && docker compose version >/dev/null 2>&1 && echo "[OK] docker compose" || echo "[WARN] docker compose"
+  local python_ver
   python_ver="$(uv python find 3.14 2>/dev/null || true)"
-  if [[ -n "$python_ver" ]]; then echo "[OK] python $python_ver"; else echo "[WARN] 未 pin Python 3.14，将在 repair 安装"; fi
+  if [[ -n "$python_ver" ]]; then echo "[OK] python $python_ver"; else echo "[WARN] 未 pin Python 3.14，请先环境修复"; fi
   [[ -f "$ROOT/pyproject.toml" ]] && echo "[OK] pyproject.toml" || { echo "[FAIL] pyproject.toml"; fail=1; }
   [[ -f "$ROOT/config.yaml" || -f "$ROOT/config.example.yaml" ]] && echo "[OK] config" || { echo "[FAIL] config"; fail=1; }
+  echo "--- 磁盘 ---"
   df -h "$ROOT" | tail -1
   if [[ -f "$ROOT/models/yolo26n.pt" ]]; then echo "[OK] yolo26n.pt"; else echo "[WARN] 缺 models/yolo26n.pt（可观看，检测停用）"; fi
   if [[ -f "$ROOT/models/buffalo_l/det_10g.onnx" ]]; then echo "[OK] buffalo_l"; else echo "[WARN] 缺 buffalo_l 模型"; fi
+  if [[ -x "$ROOT/scripts/lib/checks.sh" ]]; then
+    # shellcheck disable=SC1091
+    source "$ROOT/scripts/lib/checks.sh"
+    smartcctv_check_port "${SMARTCCTV_PORT:-8300}" || true
+  fi
   return "$fail"
 }
 
@@ -51,40 +77,18 @@ cmd_repair() {
   if [[ "$YES" -eq 1 ]] || { read -r -p "继续? [y/N] " a && [[ "$a" =~ ^[Yy]$ ]]; }; then
     uv python install 3.14
     uv python pin 3.14 || true
-    uv sync --group dev
+    # 默认 PyPI 超时则回退国内镜像（torch 仍走 pyproject 中的 pytorch-cpu index）
+    if ! UV_HTTP_TIMEOUT=120 uv sync --group dev; then
+      echo "PyPI 同步失败，改用阿里云镜像重试…"
+      UV_INDEX_URL="${UV_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}" \
+        UV_HTTP_TIMEOUT=180 uv sync --group dev
+    fi
   fi
   if [[ -d "$ROOT/frontend" ]] && have npm; then
     echo "构建前端..."
     (cd "$ROOT/frontend" && npm install && npm run build) || true
   fi
-  echo "模型下载: uv run python scripts/download_models.py （可选）"
-}
-
-is_running() {
-  [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
-}
-
-cmd_start() {
-  ensure_dirs
-  copy_config
-  if is_running; then echo "已在运行 pid=$(cat "$PID_FILE")"; return 0; fi
-  nohup uv run uvicorn server.app:app --host 0.0.0.0 --port "${SMARTCCTV_PORT:-8300}" >>"$LOG_FILE" 2>&1 &
-  echo $! >"$PID_FILE"
-  echo "已启动 pid=$(cat "$PID_FILE") log=$LOG_FILE"
-}
-
-cmd_stop() {
-  if ! is_running; then echo "未运行"; rm -f "$PID_FILE"; return 0; fi
-  kill "$(cat "$PID_FILE")" || true
-  sleep 1
-  if is_running; then kill -9 "$(cat "$PID_FILE")" || true; fi
-  rm -f "$PID_FILE"
-  echo "已停止"
-}
-
-cmd_status() {
-  if is_running; then echo "running pid=$(cat "$PID_FILE")"; else echo "stopped"; fi
-  [[ -f "$LOG_FILE" ]] && tail -n 20 "$LOG_FILE" || true
+  echo "模型下载（可选）: uv run python scripts/download_models.py"
 }
 
 cmd_test() {
@@ -96,66 +100,261 @@ cmd_test() {
   fi
 }
 
-cmd_help() {
-  cat <<EOF
-用法: ./START.sh [子命令] [--yes|--ci]
+# ---------- 启动 ----------
+is_running() {
+  [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
+}
 
-子命令:
-  diagnose   环境检测
-  repair     安装依赖/建目录/可选构建前端
-  start      终端后台启动
-  stop       停止
-  restart    重启
-  status     状态与最近日志
-  logs       跟踪日志
-  test       ruff + pytest + smoke
-  reset-totp 重置 TOTP（踢出会话）
-  help       本帮助
+docker_running() {
+  have docker || return 1
+  docker compose -f "$COMPOSE_FILE" ps --status running 2>/dev/null | grep -q smartcctv
+}
 
-无参数进入交互菜单。域名建议: cctv.lobn → 本机 IP（hosts/内网 DNS）
-EOF
+cmd_start() {
+  ensure_dirs
+  copy_config
+  if docker_running; then
+    echo "[拒绝] Docker 模式已在运行，请先停止 Docker 再终端启动（互斥）"
+    return 1
+  fi
+  if is_running; then echo "已在运行 pid=$(cat "$PID_FILE")"; return 0; fi
+  nohup uv run uvicorn server.app:app --host 0.0.0.0 --port "${SMARTCCTV_PORT:-8300}" >>"$LOG_FILE" 2>&1 &
+  echo $! >"$PID_FILE"
+  echo "已启动 pid=$(cat "$PID_FILE")  log=$LOG_FILE"
+  echo "面板: http://127.0.0.1:${SMARTCCTV_PORT:-8300} 或 http://cctv.lobn:${SMARTCCTV_PORT:-8300}"
+}
+
+cmd_stop() {
+  # 杀死终端后台进程
+  if ! is_running; then
+    echo "终端进程未运行"
+    rm -f "$PID_FILE"
+  else
+    kill "$(cat "$PID_FILE")" 2>/dev/null || true
+    sleep 1
+    if is_running; then kill -9 "$(cat "$PID_FILE")" 2>/dev/null || true; fi
+    rm -f "$PID_FILE"
+    echo "已杀死终端进程"
+  fi
+}
+
+cmd_docker_start() {
+  ensure_dirs
+  copy_config
+  if ! have docker; then echo "[FAIL] 未安装 docker"; return 1; fi
+  if is_running; then
+    echo "[拒绝] 终端模式已在运行，请先杀死进程再 Docker 启动（互斥）"
+    return 1
+  fi
+  docker compose -f "$COMPOSE_FILE" up -d --build smartcctv
+  echo "Docker 已启动（host 网络，端口 ${SMARTCCTV_PORT:-8300}）"
+}
+
+cmd_docker_stop() {
+  if ! have docker; then echo "[FAIL] 未安装 docker"; return 1; fi
+  docker compose -f "$COMPOSE_FILE" stop smartcctv 2>/dev/null || true
+  docker compose -f "$COMPOSE_FILE" rm -f smartcctv 2>/dev/null || true
+  echo "Docker 已停止"
+}
+
+# ---------- 运维 ----------
+cmd_status() {
+  echo "=== 状态 ==="
+  if is_running; then
+    echo "终端模式: running  pid=$(cat "$PID_FILE")"
+  else
+    echo "终端模式: stopped"
+  fi
+  if have docker; then
+    if docker_running; then echo "Docker 模式: running"; else echo "Docker 模式: stopped"; fi
+  else
+    echo "Docker 模式: （无 docker）"
+  fi
+  echo "--- 最近日志 ---"
+  if [[ -f "$LOG_FILE" ]]; then tail -n 20 "$LOG_FILE"; else echo "(尚日志)"; fi
+}
+
+cmd_logs() {
+  mkdir -p "$(dirname "$LOG_FILE")"
+  touch "$LOG_FILE"
+  echo "跟踪日志（Ctrl+C 返回）: $LOG_FILE"
+  # 交互里 tail -f 会占住；捕获 INT 后回到菜单
+  trap 'trap - INT; echo; echo "已停止跟踪"' INT
+  tail -f "$LOG_FILE" || true
+  trap - INT
 }
 
 cmd_reset_totp() {
   ensure_dirs
-  uv run python - <<'PY'
+  echo "将重置 TOTP 并踢出全部会话"
+  if [[ "$YES" -eq 1 ]] || { read -r -p "确认? [y/N] " a && [[ "$a" =~ ^[Yy]$ ]]; }; then
+    uv run python - <<'PY'
 from pathlib import Path
 from server.secrets import SecretStore
 store = SecretStore(Path("data/secrets"))
 print("new totp:", store.rotate_totp())
 print(store.totp_uri())
+try:
+    import qrcode
+    qr = qrcode.QRCode(border=1)
+    qr.add_data(store.totp_uri())
+    qr.make(fit=True)
+    qr.print_ascii(invert=True)
+except Exception:
+    pass
 PY
+  else
+    echo "已取消"
+  fi
+}
+
+cmd_reindex() {
+  ensure_dirs
+  echo "重建录像索引（扫描 data/recordings ↔ DB）…"
+  uv run python - <<'PY'
+import asyncio
+from pathlib import Path
+from server.config import load_config
+from server.db import Database
+from server.record import RecordService
+from server.storage import Storage
+from server.diskmon import DiskMon
+from server.bus import EventBus
+
+async def main():
+    root = Path(".").resolve()
+    cfg = load_config(root / "config.yaml") if (root / "config.yaml").exists() else load_config(root / "config.example.yaml")
+    data = cfg.data_path(root)
+    db = Database(data / "db" / "smartcctv.sqlite3")
+    await db.init()
+    storage = Storage(data, cfg.storage)
+    diskmon = DiskMon(data, cfg.disk)
+    bus = EventBus()
+    rec = RecordService(cfg, db, storage, diskmon, bus, root)
+    n = await rec.reindex()
+    print(f"完成，新增索引 {n} 条")
+
+asyncio.run(main())
+PY
+}
+
+cmd_help() {
+  cat <<EOF
+用法: ./START.sh [子命令] [--yes|--ci]
+
+交互菜单（无参数）分三组，选中后清屏覆盖刷新：
+  启动   终端启动 / 杀死进程 / Docker 启动·停止
+  运维   状态 / 日志 / 重置 TOTP / 更新录像索引 / 帮助
+  环境   环境检测 / 环境修复 / 自动化测试
+
+子命令:
+  diagnose | repair | test
+  start | stop | restart | status | logs
+  docker-start | docker-stop
+  reset-totp | reindex | help
+
+域名建议: cctv.lobn → 本机（hosts / 内网 DNS）
+EOF
+}
+
+# ---------- 菜单（覆盖刷新） ----------
+run_action() {
+  # $1=标题；其余为要执行的命令函数名
+  local title="$1"
+  shift
+  clear_screen
+  echo "SmartCCTV · $title"
+  echo "----------------------------------------"
+  "$@" || true
+  pause_back
+}
+
+menu_start() {
+  while true; do
+    clear_screen
+    cat <<EOF
+SmartCCTV · 启动
+  1) 终端启动
+  2) 杀死进程（终端模式）
+  3) Docker 启动
+  4) Docker 停止
+  0) 返回上级
+EOF
+    read -r -p "> " c
+    case "$c" in
+      1) run_action "终端启动" cmd_start ;;
+      2) run_action "杀死进程" cmd_stop ;;
+      3) run_action "Docker 启动" cmd_docker_start ;;
+      4) run_action "Docker 停止" cmd_docker_stop ;;
+      0) return 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+menu_ops() {
+  while true; do
+    clear_screen
+    cat <<EOF
+SmartCCTV · 运维
+  1) 状态
+  2) 日志（跟踪）
+  3) 重置 TOTP 密钥
+  4) 更新录像索引
+  5) 帮助
+  0) 返回上级
+EOF
+    read -r -p "> " c
+    case "$c" in
+      1) run_action "状态" cmd_status ;;
+      2) clear_screen; echo "SmartCCTV · 日志"; echo "----------------------------------------"; cmd_logs; pause_back ;;
+      3) run_action "重置 TOTP" cmd_reset_totp ;;
+      4) run_action "更新录像索引" cmd_reindex ;;
+      5) run_action "帮助" cmd_help ;;
+      0) return 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+menu_env() {
+  while true; do
+    clear_screen
+    cat <<EOF
+SmartCCTV · 环境检测
+  1) 环境检测
+  2) 环境修复 / 安装
+  3) 自动化测试
+  0) 返回上级
+EOF
+    read -r -p "> " c
+    case "$c" in
+      1) run_action "环境检测" cmd_diagnose ;;
+      2) run_action "环境修复" cmd_repair ;;
+      3) run_action "自动化测试" cmd_test ;;
+      0) return 0 ;;
+      *) ;;
+    esac
+  done
 }
 
 menu() {
   while true; do
+    clear_screen
     cat <<EOF
-
 SmartCCTV
-  1) 环境检测
-  2) 环境修复/安装
-  3) 启动
-  4) 停止
-  5) 状态
-  6) 日志
-  7) 自动化测试
-  8) 重置 TOTP
-  9) 帮助
+  1) 启动
+  2) 运维
+  3) 环境检测
   0) 退出
 EOF
     read -r -p "> " choice
     case "$choice" in
-      1) cmd_diagnose || true ;;
-      2) cmd_repair ;;
-      3) cmd_start ;;
-      4) cmd_stop ;;
-      5) cmd_status ;;
-      6) mkdir -p "$(dirname "$LOG_FILE")"; touch "$LOG_FILE"; tail -f "$LOG_FILE" ;;
-      7) cmd_test ;;
-      8) cmd_reset_totp ;;
-      9) cmd_help ;;
-      0) exit 0 ;;
-      *) echo "未知选项" ;;
+      1) menu_start ;;
+      2) menu_ops ;;
+      3) menu_env ;;
+      0) clear_screen; exit 0 ;;
+      *) ;;
     esac
   done
 }
@@ -167,12 +366,15 @@ main() {
     diagnose) cmd_diagnose ;;
     repair|install) cmd_repair ;;
     start) cmd_start ;;
-    stop) cmd_stop ;;
+    stop|kill) cmd_stop ;;
     restart) cmd_stop; cmd_start ;;
     status) cmd_status ;;
-    logs) mkdir -p "$(dirname "$LOG_FILE")"; touch "$LOG_FILE"; tail -f "$LOG_FILE" ;;
+    logs) cmd_logs ;;
+    docker-start) cmd_docker_start ;;
+    docker-stop) cmd_docker_stop ;;
     test) cmd_test ;;
     reset-totp) cmd_reset_totp ;;
+    reindex) cmd_reindex ;;
     help|-h|--help) cmd_help ;;
     *) echo "未知: $cmd"; cmd_help; exit 1 ;;
   esac

@@ -61,13 +61,20 @@ face:
 
 door:
   id: main
-  adapter: mock          # mock | http
+  adapter: center_only   # 本地永不执行继电器；开门只由 SmartCenter
   camera_id: ""
   open_seconds: 5
-  open_url: ""           # 例：http://192.168.1.50/relay/0?turn=on&timer={seconds}
+  open_url: ""           # 已废弃：请勿配置，监控忽略此字段
   close_url: ""
   method: GET
   timeout_sec: 3
+
+center:
+  enabled: false
+  events_url: "http://smartcenter.lobn:8123/api/lobn_office/events"
+  hmac_secret: ""        # 与总控 cctv_event_hmac_secret 相同
+  merge_sec: 2
+  enroll_hmac_secret: "" # 总控写入人脸库时校验
 
 notify:
   min_level: warning     # info | warning | critical

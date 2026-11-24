@@ -8,6 +8,7 @@ from pathlib import Path
 from server.auth import AuthService, RateLimiter
 from server.bus import EventBus
 from server.cameras import CameraHub
+from server.center_export import CenterExporter
 from server.config import AppConfig
 from server.db import Database
 from server.detect import DetectorService
@@ -44,6 +45,7 @@ class Runtime:
     notify: Notifier
     scheduler: Scheduler
     search: FaceSearch
+    center: CenterExporter
     tasks_ok: bool = True
 
 
@@ -62,7 +64,14 @@ def build_runtime(root: Path, config_path: Path, config: AppConfig) -> Runtime:
     door = DoorService(config.door, bus, db)
     record = RecordService(config, db, storage, diskmon, bus, root)
     notify = Notifier(config.notify, db)
+    center = CenterExporter(
+        enabled=config.center.enabled,
+        url=config.center.events_url,
+        hmac_secret=config.center.hmac_secret,
+        merge_sec=config.center.merge_sec,
+    )
     bus.add_handler(notify.submit)
+    bus.add_handler(center.submit)
     scheduler = Scheduler(config, db, load, record, storage)
     search = FaceSearch(face)
     return Runtime(
@@ -85,6 +94,7 @@ def build_runtime(root: Path, config_path: Path, config: AppConfig) -> Runtime:
         notify=notify,
         scheduler=scheduler,
         search=search,
+        center=center,
     )
 
 

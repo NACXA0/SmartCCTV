@@ -1,6 +1,8 @@
 # SmartCCTV
 
-内网智能监控：≤10 路 RTSP、纯 CPU、YOLO26 检测、人脸库 + 门禁执行末端、行为规则告警、TOTP 登录、极简告警（Gotify / 可选企业微信）。
+内网智能监控：≤10 路 RTSP、纯 CPU、YOLO26 检测、人脸库、行为规则告警、TOTP 登录、极简告警（Gotify / 可选企业微信）。
+
+**开门**：本地不执行继电器（`door.adapter: center_only`）。识别结果经 `center.events_url` 上报 SmartCenter，由总控唯一发往 ESP32ETH。
 
 域名建议：`cctv.lobn`（内网 DNS 或 hosts 指向本机）。默认端口 `8300`。
 
@@ -64,8 +66,4 @@ uv run pytest -q && uv run ruff check server tests
 
 
 
-**中央总控（权限验证+门禁+通知+AI管家，轻而稳的唯一单点）**
 
-**监控（独立进程组，主动推事件、被动受查询，视频和人脸库永不外出）**
-
-**预约小程序（云端授权+本地轮询拉令牌）**

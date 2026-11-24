@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-import uuid
 from pathlib import Path
 
 import cv2
@@ -27,27 +26,39 @@ class FaceDB:
         self.secrets = secrets
         self.ids: list[int] = []
         self.names: dict[int, str] = {}
+        self.notes: dict[int, str] = {}
         self.matrix = np.zeros((0, 512), dtype=np.float32)
 
-    def reload(self, rows: list[tuple[int, str, bytes]]) -> None:
+    def reload(self, rows: list[tuple[int, str, bytes]] | list[tuple[int, str, str, bytes]]) -> None:
         ids: list[int] = []
         names: dict[int, str] = {}
+        notes: dict[int, str] = {}
         vectors = []
-        for person_id, name, blob in rows:
+        for row in rows:
+            if len(row) == 4:
+                person_id, name, note, blob = row  # type: ignore[misc]
+            else:
+                person_id, name, blob = row  # type: ignore[misc]
+                note = ""
             try:
                 vec = np.frombuffer(self.secrets.decrypt(blob), dtype=np.float32)
             except Exception:
                 continue
             ids.append(person_id)
             names[person_id] = name
+            notes[person_id] = note or ""
             vectors.append(l2_normalize(vec))
         self.ids = ids
         self.names = names
+        self.notes = notes
         self.matrix = np.vstack(vectors) if vectors else np.zeros((0, 512), dtype=np.float32)
 
     def match(self, embedding: np.ndarray, threshold: float) -> tuple[int | None, float, str]:
         pid, score = best_match(embedding, self.matrix, self.ids, threshold)
         return pid, score, self.names.get(pid or -1, "")
+
+    def note_of(self, person_id: int) -> str:
+        return self.notes.get(person_id, "")
 
 
 class FaceService:
@@ -77,6 +88,7 @@ class FaceService:
         self._stop = asyncio.Event()
         self._confirm: dict[str, dict] = {}
         self._cooldown: dict[int, float] = {}
+        self._unknown_cooldown: dict[str, float] = {}
         self.heartbeat = time.time()
 
     def try_load(self) -> bool:
@@ -110,14 +122,14 @@ class FaceService:
 
         async def read(session):
             result = await session.execute(
-                select(FaceEmbedding.person_id, Person.name, FaceEmbedding.embedding)
+                select(FaceEmbedding.person_id, Person.name, Person.note, FaceEmbedding.embedding)
                 .join(Person, Person.id == FaceEmbedding.person_id)
                 .where(Person.enabled == 1, Person.deleted_at.is_(None))
             )
             return list(result.all())
 
         rows = await self.db.read(read)
-        self.facedb.reload([(r[0], r[1], r[2]) for r in rows])
+        self.facedb.reload([(r[0], r[1], r[2] or "", r[3]) for r in rows])
 
     async def start(self) -> None:
         self.try_load()
@@ -185,15 +197,25 @@ class FaceService:
             state["pid"] = None
             state["count"] = 0
             if score < threshold:
-                self.bus.publish(
-                    BusMessage(
-                        type="face_unknown",
-                        level="warning",
-                        cam_id=cam_id,
-                        payload={"similarity": round(score, 3)},
-                        mode=slot.mode,
+                # 归并：同摄像头 30s 内只上报一次陌生人，避免刷爆总控
+                ukey = cam_id
+                if now - self._unknown_cooldown.get(ukey, 0) >= 30:
+                    self._unknown_cooldown[ukey] = now
+                    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+                    snap = self.storage.save_jpeg(cam_id, buf.tobytes(), now) if ok else ""
+                    self.bus.publish(
+                        BusMessage(
+                            type="face_unknown",
+                            level="warning",
+                            cam_id=cam_id,
+                            payload={
+                                "similarity": round(float(score), 3),
+                                "snapshot_path": snap,
+                                "authorized": False,
+                            },
+                            mode=slot.mode,
+                        )
                     )
-                )
             return
         if state["pid"] == pid:
             state["count"] += 1
@@ -218,20 +240,18 @@ class FaceService:
         ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
         snapshot = self.storage.save_jpeg(cam_id, buf.tobytes(), now) if ok else ""
         self._cooldown[pid] = now
+        # 只上报事实；开门由 SmartCenter 决策。person.note 约定为云端 user_id
         self.bus.publish(
             BusMessage(
-                type="door.open",
+                type="face_known",
                 level="info",
                 cam_id=cam_id,
                 payload={
-                    "reason": "face_match",
                     "person_id": pid,
                     "person_name": name,
+                    "user_id": self.facedb.note_of(pid),
                     "similarity": score,
-                    "command_id": str(uuid.uuid4()),
                     "snapshot_path": snapshot,
-                    "token": None,
-                    "qr": None,
                 },
                 mode=slot.mode,
             )

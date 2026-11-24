@@ -179,6 +179,14 @@ def build_api(get_runtime) -> APIRouter:
         rows = await rt().db.read(read)
         return [{"id": r.id, "name": r.name, "note": r.note, "enabled": bool(r.enabled), "created_at": r.created_at} for r in rows]
 
+    @api.post("/faces/reload")
+    async def reload_face_index(request: Request):
+        """手动重建内存人脸索引（从 DB 重载 embedding）。"""
+        require_user(request)
+        await rt().face.reload_gallery()
+        count = len(rt().face.facedb.ids)
+        return {"ok": True, "persons_in_index": count}
+
     @api.post("/faces/persons")
     async def create_person(body: PersonBody, request: Request):
         require_user(request)
@@ -227,6 +235,90 @@ def build_api(get_runtime) -> APIRouter:
         await runtime.face.reload_gallery()
         runtime.bus.publish(BusMessage(type="face_enroll", level="info", payload={"person_id": person_id, "snapshot_path": snap}))
         return {"ok": True, "snapshot_path": snap}
+
+    @api.post("/internal/persons/enroll")
+    async def internal_enroll(request: Request):
+        """总控 HMAC 入库：note=云端 user_id。监控不执行开门。"""
+        import hashlib
+        import hmac as hm
+
+        runtime = rt()
+        secret = runtime.config.center.enroll_hmac_secret
+        if not secret:
+            raise HTTPException(503, "未配置 center.enroll_hmac_secret")
+        form = await request.form()
+        body_meta = form.get("meta_sha_body") or "{}"
+        if hasattr(body_meta, "read"):
+            body_meta = "{}"
+        meta = str(body_meta).encode()
+        ts = request.headers.get("X-Lobn-Timestamp", "")
+        nonce = request.headers.get("X-Lobn-Nonce", "")
+        sig = request.headers.get("X-Lobn-Signature", "")
+        path = "/api/internal/persons/enroll"
+        digest = hashlib.sha256(meta).hexdigest()
+        payload = f"{ts}\n{nonce}\nPOST\n{path}\n{digest}"
+        expected = hm.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        try:
+            if abs(time.time() - float(ts)) > 60:
+                raise HTTPException(401, "时间窗超时")
+        except ValueError as exc:
+            raise HTTPException(401, "时间戳无效") from exc
+        if not hm.compare_digest(expected, sig or ""):
+            raise HTTPException(401, "签名错误")
+
+        user_id = str(form.get("user_id") or "")
+        name = str(form.get("name") or user_id or "学员")
+        if not user_id:
+            raise HTTPException(400, "缺少 user_id")
+        upload = form.get("file")
+        if upload is None or not hasattr(upload, "read"):
+            raise HTTPException(400, "缺少图片文件")
+        raw = await upload.read()
+        if len(raw) > 2 * 1024 * 1024:
+            raise HTTPException(400, "图片过大")
+        image = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            raise HTTPException(400, "无法解码图片")
+        emb = runtime.face.embed_image(image)
+        if emb is None:
+            raise HTTPException(400, "未检测到合格人脸")
+
+        async def find_by_note(session):
+            result = await session.execute(
+                select(Person).where(Person.note == user_id, Person.deleted_at.is_(None))
+            )
+            return result.scalar_one_or_none()
+
+        existing = await runtime.db.read(find_by_note)
+        blob = runtime.secrets.encrypt(emb.astype(np.float32).tobytes())
+        snap = runtime.storage.save_jpeg("faces", raw)
+        existing_id = existing.id if existing is not None else None
+
+        async def write(session):
+            if existing_id is None:
+                person = Person(name=name, note=user_id, enabled=1, created_at=time.time())
+                session.add(person)
+                await session.flush()
+                pid = person.id
+            else:
+                person = await session.get(Person, existing_id)
+                pid = existing_id
+                if person is not None:
+                    person.name = name
+                    person.enabled = 1
+            session.add(
+                FaceEmbedding(
+                    person_id=pid,
+                    embedding=blob,
+                    source_snapshot_path=snap,
+                    created_at=time.time(),
+                )
+            )
+            return pid
+
+        pid = await runtime.db.write(write)
+        await runtime.face.reload_gallery()
+        return {"ok": True, "person_id": pid, "snapshot_path": snap}
 
     @api.post("/search/person/{person_id}")
     async def search_person(person_id: int, request: Request, hours: int = 168):

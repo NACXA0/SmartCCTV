@@ -95,13 +95,22 @@ class FaceConfig(BaseModel):
 
 class DoorConfig(BaseModel):
     id: str = "main"
-    adapter: Literal["mock", "http"] = "mock"
+    # 本地永不执行继电器；保留字段仅兼容旧配置，一律忽略
+    adapter: Literal["center_only", "mock", "http"] = "center_only"
     camera_id: str = ""
     open_seconds: float = 5
     open_url: str = ""
     close_url: str = ""
     method: Literal["GET", "POST"] = "GET"
     timeout_sec: float = 3
+
+
+class CenterConfig(BaseModel):
+    enabled: bool = False
+    events_url: str = ""  # 例 http://smartcenter.lobn:8123/api/lobn_office/events
+    hmac_secret: str = ""
+    merge_sec: float = 2.0
+    enroll_hmac_secret: str = ""  # 总控写入人脸库时校验
 
 
 class NotifyConfig(BaseModel):
@@ -173,6 +182,7 @@ class AppConfig(BaseModel):
     rules: list[RuleConfig] = Field(default_factory=list)
     face: FaceConfig = Field(default_factory=FaceConfig)
     door: DoorConfig = Field(default_factory=DoorConfig)
+    center: CenterConfig = Field(default_factory=CenterConfig)
     notify: NotifyConfig = Field(default_factory=NotifyConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
     retention: RetentionConfig = Field(default_factory=RetentionConfig)
