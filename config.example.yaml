@@ -1,0 +1,121 @@
+# SmartCCTV 示例配置。复制为 config.yaml 后填写。真实配置不要提交。
+# 密钥优先放 data/secrets/（0600），也可用同名环境变量覆盖。
+
+host: 0.0.0.0
+port: 8300
+timezone: Asia/Shanghai
+data_dir: data
+models_dir: models
+
+auth:
+  session_days: 7
+  max_sessions: 20
+  max_sessions_per_ip: 5
+  login_max_fails: 5
+  login_lock_seconds: 30
+
+cameras: []
+# 示例（取消注释并改 URL）：
+# cameras:
+#   - id: door
+#     name: 门口
+#     url: rtsp://user:pass@192.168.1.20/stream2
+#     role: door
+#     enabled: true
+#     analysis_fps: 3
+#     record_continuous: true
+#     night_profile:
+#       analysis_fps: 1
+#       face_mode: stricter   # stricter | alert_only
+#       face_threshold_delta: 0.08
+#       face_confirm_frames_delta: 2
+#   - id: hall
+#     name: 室内
+#     url: rtsp://192.168.1.21/stream2
+#     role: indoor
+#     enabled: true
+#     analysis_fps: 2
+#     record_continuous: false
+
+rules: []
+# 多边形/线段坐标为 0-1 归一化（相对画面宽高）。
+# rules:
+#   - id: door-zone
+#     camera_id: door
+#     kind: zone
+#     name: 门口区域
+#     points: [[0.2, 0.4], [0.8, 0.4], [0.8, 0.95], [0.2, 0.95]]
+#     loiter_seconds: 30
+#     crowd_count: 3
+#     confirm_frames: 3
+#     armed: always
+
+face:
+  threshold: 0.45
+  confirm_frames: 3
+  cooldown_sec: 120
+  min_det_score: 0.5
+  min_box_px: 48
+  det_model: models/buffalo_l/det_10g.onnx
+  rec_model: models/buffalo_l/w600k_r50.onnx
+
+door:
+  id: main
+  adapter: mock          # mock | http
+  camera_id: ""
+  open_seconds: 5
+  open_url: ""           # 例：http://192.168.1.50/relay/0?turn=on&timer={seconds}
+  close_url: ""
+  method: GET
+  timeout_sec: 3
+
+notify:
+  min_level: warning     # info | warning | critical
+  cooldown_sec: 60
+  gotify_url: ""         # 例：http://127.0.0.1:8070
+  gotify_token: ""
+  wecom_webhook: ""
+
+storage:
+  s3_enabled: false
+  endpoint: http://127.0.0.1:9000
+  access_key: ""
+  secret_key: ""
+  bucket: smartcctv
+  region: us-east-1
+  hot_event_days: 7
+  hot_continuous_days: 14
+
+retention:
+  continuous_days: 14
+  event_days: 30
+  snapshot_days: 30
+
+disk:
+  reserve_gb: 20
+  reserve_ratio: 0.10
+  warn_free_ratio: 0.20
+  critical_free_ratio: 0.05
+  resume_hysteresis: 0.05
+
+scheduler:
+  valley_start: "03:00"
+  valley_end: "06:00"
+  idle_cpu: 30
+  idle_minutes: 5
+  max_concurrent: 2
+
+detect:
+  model: models/yolo26n.pt
+  imgsz: 640
+  conf: 0.35
+  max_boxes: 50
+  activity_gate: 1.2
+  force_interval_sec: 2
+  torch_threads: 2
+
+watch:
+  max_viewers: 4
+  fanout_per_camera: 3
+  jpeg_quality: 70
+  display_width: 960

@@ -1,0 +1,21 @@
+services:
+  smartcctv:
+    build: .
+    network_mode: host
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data
+      - ./models:/app/models
+    environment:
+      - SMARTCCTV_PORT=8300
+    restart: unless-stopped
+
+  rustfs:
+    image: rustfs/rustfs:latest
+    profiles: ["s3"]
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - ./data/s3:/data
+    restart: unless-stopped
