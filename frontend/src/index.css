@@ -1,52 +1,29 @@
 @import "tailwindcss";
 
-
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&family=JetBrains+Mono&display=swap');
-@import "tailwindcss";
-
-
 :root {
-    --bg-dark: #050505;
-    --panel-bg: rgba(20, 20, 25, 0.7);
-    --accent-blue: #3b82f6;
-    --accent-red: #ef4444;
-    --text-main: #f8fafc;
-    --text-muted: #94a3b8;
-    --glass-border: rgba(255, 255, 255, 0.08);
+  --ink: #1a1f24;
+  --paper: #eef2f4;
+  --panel: #f7f9fa;
+  --line: #d3dce0;
+  --accent: #0f6e56;
+  --warn: #b45309;
+  --crit: #b42318;
+  --muted: #5b6770;
 }
 
-.app-main {
-    padding: 2rem;
-    margin-left: 25px;
-    margin-right: 25px;
-}
+* { box-sizing: border-box; }
 
-
-* {
-    box-sizing: border-box;
-
+html, body, #root {
+  height: 100%;
+  margin: 0;
 }
 
 body {
-    background-color: var(--bg-dark);
-    color: var(--text-main);
-    font-family: 'Inter', sans-serif;
-    overflow: hidden;
-    /* We want a fixed dashboard look */
+  font-family: "IBM Plex Sans", sans-serif;
+  color: var(--ink);
+  background:
+    radial-gradient(1200px 600px at 10% -10%, #d9ebe4 0%, transparent 55%),
+    linear-gradient(180deg, #f4f7f8 0%, #e8eef1 100%);
 }
 
-/* Glassmorphism utility */
-.glass-panel {
-    background: var(--panel-bg);
-    backdrop-filter: blur(12px);
-    border: 1px solid var(--glass-border);
-    border-radius: 16px;
-}
-
-.glow-blue {
-    box-shadow: 0 0 20px rgba(59, 130, 246, 0.2);
-}
-
-.glow-red {
-    box-shadow: 0 0 20px rgba(239, 68, 68, 0.4);
-}
+.mono { font-family: "IBM Plex Mono", monospace; }

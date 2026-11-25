@@ -1,0 +1,63 @@
+[project]
+name = "smartcctv"
+version = "0.1.0"
+description = "内网智能监控：YOLO 检测、人脸库、门禁执行末端、极简告警"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "sqlalchemy[asyncio]>=2.0",
+    "aiosqlite>=0.20",
+    "greenlet>=3.0",
+    "pydantic>=2.10",
+    "pyyaml>=6.0",
+    "pyotp>=2.9",
+    "itsdangerous>=2.2",
+    "httpx>=0.28",
+    "numpy>=2.0",
+    "opencv-python-headless>=4.10",
+    "onnxruntime>=1.20",
+    "qrcode>=8.0",
+    "python-multipart>=0.0.18",
+    "cryptography>=44.0",
+    "ultralytics>=8.3",
+    "torch>=2.6",
+    "boto3>=1.35",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.25",
+    "ruff>=0.8",
+]
+
+[tool.uv]
+package = false
+# ultralytics 会拉 opencv-python；无 GUI 环境强制只用 headless
+override-dependencies = [
+    "opencv-python ; sys_platform == 'never'",
+]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 110
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501"]
