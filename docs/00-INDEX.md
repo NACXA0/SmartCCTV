@@ -6,8 +6,10 @@
 
 ## 归档声明（2026-11-25）
 
-**本目录描述的自研监控方案已废弃。** 智慧办公室改为 **HAOS + Frigate 官方插件** 承担感知与录像；SmartCenter 只做总控与云端业务。  
-勿按 06/07/09 再实现一套 CCTV。决策全文：[../../docs/决策-归档自研SmartCCTV.md](../../docs/决策-归档自研SmartCCTV.md)。下列文档仅作历史调研存档。
+**本目录描述的自研监控方案已废弃。**  
+终态：**HAOS 四 App**（HA + Mosquitto + Frigate Full Access + analytics-sidecar）+ MQTT，见 [../../docs/架构-HAOS四App.md](../../docs/架构-HAOS四App.md)。  
+决策：[../../docs/决策-归档自研SmartCCTV.md](../../docs/决策-归档自研SmartCCTV.md) · 清单：[../../docs/归档-SmartCCTV准备清单.md](../../docs/归档-SmartCCTV准备清单.md)。  
+勿按 06/07/09 再实现一套 CCTV；勿做 HMAC「兼容 sidecar」。下列文档仅作历史调研存档。
 
 ---
 
