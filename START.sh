@@ -6,6 +6,8 @@ cd "$ROOT"
 PID_FILE="$ROOT/data/smartcctv.pid"
 LOG_FILE="$ROOT/data/logs/smartcctv.log"
 COMPOSE_FILE="$ROOT/docker-compose.yml"
+FRONTEND_DIR="$ROOT/frontend"
+EXPORT_DIR="$ROOT/export"
 YES=0
 CI=0
 
@@ -84,11 +86,12 @@ cmd_repair() {
         UV_HTTP_TIMEOUT=180 uv sync --group dev
     fi
   fi
-  if [[ -d "$ROOT/frontend" ]] && have npm; then
-    echo "构建前端..."
-    (cd "$ROOT/frontend" && npm install && npm run build) || true
+  if [[ -d "$FRONTEND_DIR" ]] && have npm; then
+    echo "安装前端依赖（不强制 build）…"
+    (cd "$FRONTEND_DIR" && npm install) || true
   fi
   echo "模型下载（可选）: uv run python scripts/download_models.py"
+  echo "编译前端请用启动菜单「编译前端」"
 }
 
 cmd_test() {
@@ -118,10 +121,112 @@ cmd_start() {
     return 1
   fi
   if is_running; then echo "已在运行 pid=$(cat "$PID_FILE")"; return 0; fi
-  nohup uv run uvicorn server.app:app --host 0.0.0.0 --port "${SMARTCCTV_PORT:-8300}" >>"$LOG_FILE" 2>&1 &
+  local port="${SMARTCCTV_PORT:-8300}"
+  nohup uv run uvicorn server.app:app --host 0.0.0.0 --port "$port" >>"$LOG_FILE" 2>&1 &
   echo $! >"$PID_FILE"
   echo "已启动 pid=$(cat "$PID_FILE")  log=$LOG_FILE"
-  echo "面板: http://127.0.0.1:${SMARTCCTV_PORT:-8300} 或 http://cctv.lobn:${SMARTCCTV_PORT:-8300}"
+  echo "面板: http://127.0.0.1:${port} 或 http://cctv.lobn:${port}"
+  if [[ ! -f "$FRONTEND_DIR/dist/index.html" ]]; then
+    echo "[WARN] 无 frontend/dist，生产页仅 API 提示；请编译或解压 frontend.zip"
+  fi
+}
+
+cmd_start_fg() {
+  ensure_dirs
+  copy_config
+  if docker_running; then
+    echo "[拒绝] Docker 模式已在运行"
+    return 1
+  fi
+  local port="${SMARTCCTV_PORT:-8300}"
+  echo "前台 API port=$port（Ctrl+C 停止）"
+  uv run uvicorn server.app:app --host 0.0.0.0 --port "$port"
+}
+
+cmd_dev() {
+  ensure_dirs
+  copy_config
+  have npm || { echo "[FAIL] 需要 npm"; return 1; }
+  if docker_running; then
+    echo "[拒绝] Docker 模式已在运行"
+    return 1
+  fi
+  if is_running; then
+    echo "先停止后台进程…"
+    cmd_stop
+  fi
+  [[ -d "$FRONTEND_DIR/node_modules" ]] || (cd "$FRONTEND_DIR" && npm install)
+  local port="${SMARTCCTV_PORT:-8300}"
+  echo "开发：后端 :${port} + Vite :5173（/api 代理）"
+  echo "打开 http://127.0.0.1:5173  · Ctrl+C 停两端"
+  echo "----------------------------------------"
+  uv run uvicorn server.app:app --host 0.0.0.0 --port "$port" --reload &
+  local api_pid=$!
+  echo "$api_pid" >"$PID_FILE"
+  cleanup() {
+    echo
+    echo "停止开发进程…"
+    kill "$api_pid" 2>/dev/null || true
+    wait "$api_pid" 2>/dev/null || true
+    rm -f "$PID_FILE"
+  }
+  trap cleanup EXIT INT TERM
+  (cd "$FRONTEND_DIR" && npm run dev)
+}
+
+cmd_build_frontend() {
+  have npm || { echo "[FAIL] 需要 npm"; return 1; }
+  [[ -d "$FRONTEND_DIR" ]] || { echo "无 frontend/"; return 1; }
+  echo "编译前端 → frontend/dist"
+  (cd "$FRONTEND_DIR" && npm install && npm run build)
+  echo "完成: $FRONTEND_DIR/dist"
+}
+
+cmd_export() {
+  ensure_dirs
+  mkdir -p "$EXPORT_DIR"
+  local stamp stage out_be out_fe
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  out_be="$EXPORT_DIR/backend-${stamp}.zip"
+  out_fe="$EXPORT_DIR/frontend-${stamp}.zip"
+  stage="$(mktemp -d)"
+  echo "=== 导出（不编译）结构对齐开发：server/ + frontend/dist/ ==="
+
+  mkdir -p "$stage/pack"
+  rsync -a \
+    --exclude '.venv' --exclude '__pycache__' --exclude '*.pyc' \
+    --exclude 'data' --exclude 'frontend' --exclude 'export' \
+    --exclude '.pytest_cache' --exclude 'tests' --exclude 'docs' \
+    --exclude 'models/*.pt' --exclude 'models/buffalo_l' \
+    "$ROOT/server" "$ROOT/pyproject.toml" "$ROOT/START.sh" \
+    "$ROOT/config.example.yaml" "$ROOT/docker-compose.yml" \
+    "$stage/pack/"
+  [[ -f "$ROOT/uv.lock" ]] && cp "$ROOT/uv.lock" "$stage/pack/"
+  mkdir -p "$stage/pack/data/"{db,secrets,recordings,snapshots,thumbs,logs,s3} "$stage/pack/models"
+  cat >"$stage/pack/README-RUN.txt" <<'EOF'
+SmartCCTV 运行包
+1. uv sync
+2. cp config.example.yaml config.yaml
+3. 解压 frontend.zip 得到 frontend/dist/
+4. ./START.sh start
+模型需自行放入 models/（或 scripts/download_models.py）
+EOF
+  (cd "$stage/pack" && zip -qr "$out_be" .)
+  echo "[OK] $out_be"
+
+  if [[ ! -f "$FRONTEND_DIR/dist/index.html" ]]; then
+    echo "[FAIL] 无 frontend/dist，请先编译前端"
+    rm -rf "$stage"
+    return 1
+  fi
+  mkdir -p "$stage/fe/frontend"
+  rsync -a "$FRONTEND_DIR/dist" "$stage/fe/frontend/"
+  (cd "$stage/fe" && zip -qr "$out_fe" frontend)
+  echo "[OK] $out_fe"
+  ln -sfn "$(basename "$out_be")" "$EXPORT_DIR/backend.zip"
+  ln -sfn "$(basename "$out_fe")" "$EXPORT_DIR/frontend.zip"
+  echo "软链: $EXPORT_DIR/backend.zip  $EXPORT_DIR/frontend.zip"
+  rm -rf "$stage"
 }
 
 cmd_stop() {
@@ -243,13 +348,14 @@ cmd_help() {
 用法: ./START.sh [子命令] [--yes|--ci]
 
 交互菜单（无参数）分三组，选中后清屏覆盖刷新：
-  启动   终端启动 / 杀死进程 / Docker 启动·停止
+  启动   终端/开发/编译/导出 / 杀死进程 / Docker
   运维   状态 / 日志 / 重置 TOTP / 更新录像索引 / 帮助
   环境   环境检测 / 环境修复 / 自动化测试
 
 子命令:
   diagnose | repair | test
-  start | stop | restart | status | logs
+  start | start-fg | dev | build-frontend | export
+  stop | restart | status | logs
   docker-start | docker-stop
   reset-totp | reindex | help
 
@@ -274,18 +380,26 @@ menu_start() {
     clear_screen
     cat <<EOF
 SmartCCTV · 启动
-  1) 终端启动
-  2) 杀死进程（终端模式）
-  3) Docker 启动
-  4) Docker 停止
+  1) 终端启动（生产：有 dist 则托管面板）
+  2) 前台启动 API
+  3) 开发（Vite + 后端，终端）
+  4) 编译前端
+  5) 导出部署包（backend.zip + frontend.zip，不编译）
+  6) 杀死进程（终端模式）
+  7) Docker 启动
+  8) Docker 停止
   0) 返回上级
 EOF
     read -r -p "> " c
     case "$c" in
       1) run_action "终端启动" cmd_start ;;
-      2) run_action "杀死进程" cmd_stop ;;
-      3) run_action "Docker 启动" cmd_docker_start ;;
-      4) run_action "Docker 停止" cmd_docker_stop ;;
+      2) clear_screen; echo "SmartCCTV · 前台 API"; echo "----------------------------------------"; cmd_start_fg || true; pause_back ;;
+      3) clear_screen; echo "SmartCCTV · 开发"; echo "----------------------------------------"; cmd_dev || true; pause_back ;;
+      4) run_action "编译前端" cmd_build_frontend ;;
+      5) run_action "导出部署包" cmd_export ;;
+      6) run_action "杀死进程" cmd_stop ;;
+      7) run_action "Docker 启动" cmd_docker_start ;;
+      8) run_action "Docker 停止" cmd_docker_stop ;;
       0) return 0 ;;
       *) ;;
     esac
@@ -366,6 +480,10 @@ main() {
     diagnose) cmd_diagnose ;;
     repair|install) cmd_repair ;;
     start) cmd_start ;;
+    start-fg) cmd_start_fg ;;
+    dev) cmd_dev ;;
+    build-frontend|build) cmd_build_frontend ;;
+    export) cmd_export ;;
     stop|kill) cmd_stop ;;
     restart) cmd_stop; cmd_start ;;
     status) cmd_status ;;

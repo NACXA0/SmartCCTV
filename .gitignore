@@ -37,3 +37,6 @@ Thumbs.db
 # Logs / pid
 *.log
 *.pid
+
+# 部署导出
+export/
