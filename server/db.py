@@ -48,6 +48,20 @@ class FaceSighting(Base):
     ts: Mapped[float] = mapped_column(Float, index=True)
 
 
+class DoorPassage(Base):
+    """一次开门窗口内的通行摘要；云端只收人数/陌生人计数，不收向量与抓拍。"""
+
+    __tablename__ = "door_passages"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    command_id: Mapped[str] = mapped_column(String(64), index=True)
+    people_count: Mapped[int] = mapped_column(Integer, default=0)
+    stranger_count: Mapped[int] = mapped_column(Integer, default=0)
+    first_snapshot_path: Mapped[str] = mapped_column(Text, default="")
+    started_at: Mapped[float] = mapped_column(Float, index=True)
+    ended_at: Mapped[float] = mapped_column(Float, default=0)
+    truncated: Mapped[int] = mapped_column(Integer, default=0)
+
+
 class EventRow(Base):
     __tablename__ = "events"
     __table_args__ = (Index("ix_events_cam_ts", "cam_id", "ts"),)

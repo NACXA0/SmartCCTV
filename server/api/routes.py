@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac as hm
 import json
 import time
 
@@ -28,6 +30,24 @@ class LoginBody(BaseModel):
 class PersonBody(BaseModel):
     name: str
     note: str = ""
+
+
+def _verify_center_hmac(request: Request, secret: str, path: str, body: bytes) -> None:
+    if not secret:
+        raise HTTPException(503, "未配置 center.enroll_hmac_secret")
+    ts = request.headers.get("X-Lobn-Timestamp", "")
+    nonce = request.headers.get("X-Lobn-Nonce", "")
+    sig = request.headers.get("X-Lobn-Signature", "")
+    digest = hashlib.sha256(body).hexdigest()
+    payload = f"{ts}\n{nonce}\n{request.method.upper()}\n{path}\n{digest}"
+    expected = hm.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    try:
+        if abs(time.time() - float(ts)) > 60:
+            raise HTTPException(401, "时间窗超时")
+    except ValueError as exc:
+        raise HTTPException(401, "时间戳无效") from exc
+    if not hm.compare_digest(expected, sig or ""):
+        raise HTTPException(401, "签名错误")
 
 
 def build_api(get_runtime) -> APIRouter:
@@ -236,35 +256,147 @@ def build_api(get_runtime) -> APIRouter:
         runtime.bus.publish(BusMessage(type="face_enroll", level="info", payload={"person_id": person_id, "snapshot_path": snap}))
         return {"ok": True, "snapshot_path": snap}
 
+    def _parse_passage_start(raw: bytes) -> tuple[str, float]:
+        try:
+            data = json.loads(raw.decode() or "{}")
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise HTTPException(400, "无效 JSON") from exc
+        if not isinstance(data, dict):
+            raise HTTPException(400, "无效 JSON")
+        command_id = str(data.get("command_id") or "").strip()
+        try:
+            seconds = float(data.get("seconds", 5))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, "seconds 无效") from exc
+        if not command_id:
+            raise HTTPException(400, "缺少 command_id")
+        if seconds < 0.1 or seconds > 600:
+            raise HTTPException(400, "seconds 超出范围")
+        return command_id, seconds
+
+    @api.post("/internal/capture/assist")
+    async def capture_assist(request: Request):
+        """总控 PIR/按钮唤醒认证捕捉（与开门后 passages 分开）。无画面只回 frames=0。"""
+        runtime = rt()
+        raw = await request.body()
+        _verify_center_hmac(
+            request,
+            runtime.config.center.enroll_hmac_secret,
+            "/api/internal/capture/assist",
+            raw,
+        )
+        try:
+            data = json.loads(raw.decode() or "{}")
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise HTTPException(400, "无效 JSON") from exc
+        source = str((data or {}).get("source") or "assist")
+        try:
+            seconds = float((data or {}).get("seconds") or 8)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, "seconds 无效") from exc
+        return runtime.face.start_assist(source, seconds)
+
+    @api.post("/passages/start")
+    async def passages_start(request: Request):
+        """总控开门成功后通知：开始采集通行窗口。会话或 HMAC 均可。"""
+        runtime = rt()
+        raw = await request.body()
+        token = request.cookies.get("session", "")
+        if runtime.auth.read_token(token) is None:
+            _verify_center_hmac(
+                request,
+                runtime.config.center.enroll_hmac_secret,
+                "/api/passages/start",
+                raw,
+            )
+        command_id, seconds = _parse_passage_start(raw)
+        try:
+            return await runtime.passages.start(command_id, seconds)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @api.post("/internal/passages/start")
+    async def internal_passages_start(request: Request):
+        """总控 HMAC 专用入口（与 /passages/start 同语义）。"""
+        runtime = rt()
+        raw = await request.body()
+        _verify_center_hmac(
+            request,
+            runtime.config.center.enroll_hmac_secret,
+            "/api/internal/passages/start",
+            raw,
+        )
+        command_id, seconds = _parse_passage_start(raw)
+        try:
+            return await runtime.passages.start(command_id, seconds)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @api.post("/passages/stop")
+    async def passages_stop(request: Request):
+        """提前结束采集并返回摘要，供总控回云端。"""
+        runtime = rt()
+        raw = await request.body()
+        token = request.cookies.get("session", "")
+        if runtime.auth.read_token(token) is None:
+            _verify_center_hmac(
+                request,
+                runtime.config.center.enroll_hmac_secret,
+                "/api/passages/stop",
+                raw,
+            )
+        try:
+            data = json.loads(raw.decode() or "{}")
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise HTTPException(400, "无效 JSON") from exc
+        command_id = str((data or {}).get("command_id") or "").strip()
+        if not command_id:
+            raise HTTPException(400, "缺少 command_id")
+        summary = await runtime.passages.stop(command_id)
+        if summary is None:
+            # 可能已自然结束：回落查库
+            summary = await runtime.passages.get_by_command(command_id)
+        if summary is None:
+            raise HTTPException(404, "通行记录不存在")
+        return summary
+
+    @api.get("/passages")
+    async def passages_list(request: Request, limit: int = 50):
+        require_user(request)
+        return await rt().passages.list_passages(limit=limit)
+
+    @api.get("/passages/by-command/{command_id}")
+    async def passages_by_command(command_id: str, request: Request):
+        """按 command_id 取最近一次通行摘要（总控可读）。会话或 HMAC。"""
+        runtime = rt()
+        token = request.cookies.get("session", "")
+        if runtime.auth.read_token(token) is None:
+            _verify_center_hmac(
+                request,
+                runtime.config.center.enroll_hmac_secret,
+                f"/api/passages/by-command/{command_id}",
+                b"",
+            )
+        summary = await runtime.passages.get_by_command(command_id)
+        if summary is None:
+            raise HTTPException(404, "通行记录不存在")
+        return summary
+
     @api.post("/internal/persons/enroll")
     async def internal_enroll(request: Request):
         """总控 HMAC 入库：note=云端 user_id。监控不执行开门。"""
-        import hashlib
-        import hmac as hm
-
         runtime = rt()
-        secret = runtime.config.center.enroll_hmac_secret
-        if not secret:
-            raise HTTPException(503, "未配置 center.enroll_hmac_secret")
         form = await request.form()
         body_meta = form.get("meta_sha_body") or "{}"
         if hasattr(body_meta, "read"):
             body_meta = "{}"
         meta = str(body_meta).encode()
-        ts = request.headers.get("X-Lobn-Timestamp", "")
-        nonce = request.headers.get("X-Lobn-Nonce", "")
-        sig = request.headers.get("X-Lobn-Signature", "")
-        path = "/api/internal/persons/enroll"
-        digest = hashlib.sha256(meta).hexdigest()
-        payload = f"{ts}\n{nonce}\nPOST\n{path}\n{digest}"
-        expected = hm.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
-        try:
-            if abs(time.time() - float(ts)) > 60:
-                raise HTTPException(401, "时间窗超时")
-        except ValueError as exc:
-            raise HTTPException(401, "时间戳无效") from exc
-        if not hm.compare_digest(expected, sig or ""):
-            raise HTTPException(401, "签名错误")
+        _verify_center_hmac(
+            request,
+            runtime.config.center.enroll_hmac_secret,
+            "/api/internal/persons/enroll",
+            meta,
+        )
 
         user_id = str(form.get("user_id") or "")
         name = str(form.get("name") or user_id or "学员")

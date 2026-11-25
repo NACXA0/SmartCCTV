@@ -69,17 +69,20 @@ function Dashboard() {
   const [persons, setPersons] = useState([])
   const [stats, setStats] = useState(null)
   const [doorLogs, setDoorLogs] = useState([])
+  const [passages, setPassages] = useState([])
   const [newName, setNewName] = useState('')
+  const [reloadMsg, setReloadMsg] = useState('')
   const [tab, setTab] = useState('live')
 
   const refresh = async () => {
-    const [cams, ev, h, p, s, d] = await Promise.all([
+    const [cams, ev, h, p, s, d, pas] = await Promise.all([
       api('/api/cameras'),
       api('/api/events?limit=30'),
       api('/api/system/health'),
       api('/api/faces/persons'),
       api('/api/stats?hours=24'),
       api('/api/door/logs?limit=20'),
+      api('/api/passages?limit=30'),
     ])
     setCameras(cams)
     setEvents(ev)
@@ -87,6 +90,7 @@ function Dashboard() {
     setPersons(p)
     setStats(s)
     setDoorLogs(d)
+    setPassages(pas)
   }
 
   const addPerson = async (e) => {
@@ -138,6 +142,16 @@ function Dashboard() {
   const openDoor = async () => {
     await api('/api/door/open', { method: 'POST' })
     await refresh()
+  }
+
+  const reloadFaceIndex = async () => {
+    setReloadMsg('')
+    try {
+      const res = await api('/api/faces/reload', { method: 'POST' })
+      setReloadMsg(`索引已重建：${res.persons_in_index ?? 0} 人`)
+    } catch (err) {
+      setReloadMsg(err.message || '重建失败')
+    }
   }
 
   return (
@@ -232,7 +246,17 @@ function Dashboard() {
         {tab === 'faces' && (
           <div className="grid gap-4 lg:grid-cols-2">
             <section className="bg-white border border-[#d5dee3]">
-              <div className="px-4 py-3 border-b border-[#e6ecef] font-medium">人员</div>
+              <div className="px-4 py-3 border-b border-[#e6ecef] flex items-center justify-between gap-3">
+                <span className="font-medium">人员</span>
+                <button
+                  type="button"
+                  onClick={() => reloadFaceIndex().catch((err) => setReloadMsg(err.message || '重建失败'))}
+                  className="text-sm border border-[#cfd8dd] px-3 py-1.5"
+                >
+                  重建索引
+                </button>
+              </div>
+              {reloadMsg && <div className="px-4 py-2 text-xs text-[var(--muted)] border-b border-[#eef2f4]">{reloadMsg}</div>}
               <form onSubmit={addPerson} className="p-4 flex gap-2 border-b border-[#eef2f4]">
                 <input
                   className="flex-1 border border-[#cfd8dd] px-3 py-2"
@@ -274,6 +298,27 @@ function Dashboard() {
                   </li>
                 ))}
                 {doorLogs.length === 0 && <li className="px-4 py-8 text-[var(--muted)]">暂无门禁记录</li>}
+              </ul>
+            </section>
+            <section className="bg-white border border-[#d5dee3] lg:col-span-2">
+              <div className="px-4 py-3 border-b border-[#e6ecef] font-medium">开门通行</div>
+              <ul className="divide-y divide-[#eef2f4]">
+                {passages.map((row) => (
+                  <li key={row.id || row.command_id} className="px-4 py-3 text-sm flex flex-wrap gap-3">
+                    <span className="mono text-[var(--muted)] w-40 shrink-0">
+                      {row.started_at ? new Date(row.started_at * 1000).toLocaleString() : '—'}
+                    </span>
+                    <span className="mono w-44 shrink-0 truncate" title={row.command_id}>
+                      {row.command_id}
+                    </span>
+                    <span className="w-28">人数 {row.people_count}</span>
+                    <span className="w-28">陌生人 {row.stranger_count}</span>
+                    <span className={row.truncated ? 'text-[var(--warn)]' : 'text-[var(--muted)]'}>
+                      {row.truncated ? '已截断' : '完整'}
+                    </span>
+                  </li>
+                ))}
+                {passages.length === 0 && <li className="px-4 py-8 text-[var(--muted)]">暂无通行记录。总控开门成功后会开始采集。</li>}
               </ul>
             </section>
           </div>

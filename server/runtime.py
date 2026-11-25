@@ -17,6 +17,7 @@ from server.door import DoorService
 from server.face.pipeline import FaceService
 from server.load import LoadGauge
 from server.notify import Notifier
+from server.passages import PassageCollector
 from server.record import RecordService
 from server.scheduler import Scheduler
 from server.search import FaceSearch
@@ -41,6 +42,7 @@ class Runtime:
     detector: DetectorService
     face: FaceService
     door: DoorService
+    passages: PassageCollector
     record: RecordService
     notify: Notifier
     scheduler: Scheduler
@@ -62,6 +64,8 @@ def build_runtime(root: Path, config_path: Path, config: AppConfig) -> Runtime:
     detector = DetectorService(config, hub, bus, db, load, root)
     face = FaceService(config, hub, bus, db, secrets, storage, root)
     door = DoorService(config.door, bus, db)
+    passages = PassageCollector(db, bus)
+    face.passages = passages
     record = RecordService(config, db, storage, diskmon, bus, root)
     notify = Notifier(config.notify, db)
     center = CenterExporter(
@@ -90,6 +94,7 @@ def build_runtime(root: Path, config_path: Path, config: AppConfig) -> Runtime:
         detector=detector,
         face=face,
         door=door,
+        passages=passages,
         record=record,
         notify=notify,
         scheduler=scheduler,

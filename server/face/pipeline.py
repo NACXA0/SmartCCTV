@@ -13,6 +13,7 @@ import numpy as np
 from server.bus import BusMessage, EventBus
 from server.cameras import CameraHub
 from server.config import AppConfig
+from server.db import FaceSighting
 from server.face.arcface import ArcFace, align_face
 from server.face.detector import ScrfdDetector
 from server.face.match import best_match, l2_normalize
@@ -79,6 +80,7 @@ class FaceService:
         self.secrets = secrets
         self.storage = storage
         self.root = root
+        self.passages = None  # 由 runtime 注入 PassageCollector
         self.facedb = FaceDB(secrets)
         self.detector: ScrfdDetector | None = None
         self.recognizer: ArcFace | None = None
@@ -90,6 +92,50 @@ class FaceService:
         self._cooldown: dict[int, float] = {}
         self._unknown_cooldown: dict[str, float] = {}
         self.heartbeat = time.time()
+        # 认证捕捉辅助窗口（PIR/按钮）：与开门后 passages 分开
+        self.assist_until: float = 0.0
+        self.assist_source: str = ""
+        self.assist_frames: int = 0
+
+    async def _write_sighting(
+        self,
+        *,
+        cam_id: str,
+        person_id: int | None,
+        embedding: np.ndarray,
+        snapshot_path: str,
+        similarity: float,
+        det_score: float,
+        ts: float,
+    ) -> None:
+        """本地留痕；不上传 embedding 到云端。"""
+        blob = self.secrets.encrypt(np.asarray(embedding, dtype=np.float32).tobytes())
+
+        async def write(session):
+            session.add(
+                FaceSighting(
+                    cam_id=cam_id,
+                    person_id=person_id,
+                    embedding=blob,
+                    snapshot_path=snapshot_path or "",
+                    similarity=float(similarity),
+                    det_score=float(det_score),
+                    ts=ts,
+                )
+            )
+
+        try:
+            await self.db.write(write)
+        except Exception:
+            log.exception("写入 FaceSighting 失败 cam=%s person_id=%s", cam_id, person_id)
+
+    def _observe_passage(self, person_id: int | None, snapshot_path: str = "") -> None:
+        if self.passages is None:
+            return
+        try:
+            self.passages.observe(person_id, snapshot_path or "")
+        except Exception:
+            log.exception("通行观察失败")
 
     def try_load(self) -> bool:
         det = Path(self.config.face.det_model)
@@ -146,6 +192,35 @@ class FaceService:
             except asyncio.CancelledError:
                 pass
 
+    def start_assist(self, source: str, seconds: float) -> dict:
+        """总控 PIR/按钮唤醒：打标强制跑门口识别；已在循环则不双开。"""
+        now = time.time()
+        sec = max(0.5, min(float(seconds), 60.0))
+        door_cam = self.config.door.camera_id
+        targets = [door_cam] if door_cam else [c.id for c in self.config.cameras if c.role == "door"]
+        frames = 0
+        for cam_id in targets:
+            if not cam_id:
+                continue
+            slot = self.hub.get(cam_id)
+            if slot is not None and getattr(slot, "frame", None) is not None:
+                frames += 1
+        # 延长或新开窗口（不取消已有循环）
+        self.assist_until = max(self.assist_until, now + sec)
+        self.assist_source = source or "assist"
+        self.assist_frames = frames
+        return {
+            "ok": True,
+            "source": self.assist_source,
+            "seconds": sec,
+            "frames": frames,
+            "until": self.assist_until,
+            "loop_running": self._task is not None and not self._task.done(),
+        }
+
+    def assist_active(self) -> bool:
+        return time.time() < self.assist_until
+
     async def _loop(self) -> None:
         while not self._stop.is_set():
             self.heartbeat = time.time()
@@ -162,6 +237,8 @@ class FaceService:
         slot = self.hub.get(cam_id)
         if not slot or slot.frame is None:
             return
+        if self.assist_active():
+            self.assist_frames += 1
         cam = next((c for c in self.config.cameras if c.id == cam_id), None)
         if cam is None:
             return
@@ -191,18 +268,31 @@ class FaceService:
         emb = await asyncio.to_thread(self.recognizer.embed, aligned)
         pid, score, name = self.facedb.match(emb, threshold)
         now = time.time()
+        det_score = float(face.get("score") or 0)
         key = cam_id
         state = self._confirm.setdefault(key, {"pid": None, "count": 0})
         if pid is None:
             state["pid"] = None
             state["count"] = 0
             if score < threshold:
-                # 归并：同摄像头 30s 内只上报一次陌生人，避免刷爆总控
+                # 通行窗口内仍要计数（短去重在 PassageCollector）
+                self._observe_passage(None, "")
+                # 归并：同摄像头 30s 内只上报/落库一次陌生人，避免刷爆总控与磁盘
                 ukey = cam_id
                 if now - self._unknown_cooldown.get(ukey, 0) >= 30:
                     self._unknown_cooldown[ukey] = now
                     ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
                     snap = self.storage.save_jpeg(cam_id, buf.tobytes(), now) if ok else ""
+                    self._observe_passage(None, snap)
+                    await self._write_sighting(
+                        cam_id=cam_id,
+                        person_id=None,
+                        embedding=emb,
+                        snapshot_path=snap,
+                        similarity=score,
+                        det_score=det_score,
+                        ts=now,
+                    )
                     self.bus.publish(
                         BusMessage(
                             type="face_unknown",
@@ -224,9 +314,21 @@ class FaceService:
             state["count"] = 1
         if state["count"] < confirm_need:
             return
+        # 通行窗口：确认帧够即可观察，不受开门冷却限制
+        self._observe_passage(pid, "")
         if now - self._cooldown.get(pid, 0) < self.config.face.cooldown_sec:
             return
         if night and cam.night_profile.face_mode == "alert_only":
+            await self._write_sighting(
+                cam_id=cam_id,
+                person_id=pid,
+                embedding=emb,
+                snapshot_path="",
+                similarity=score,
+                det_score=det_score,
+                ts=now,
+            )
+            self._cooldown[pid] = now
             self.bus.publish(
                 BusMessage(
                     type="face_known",
@@ -240,6 +342,16 @@ class FaceService:
         ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
         snapshot = self.storage.save_jpeg(cam_id, buf.tobytes(), now) if ok else ""
         self._cooldown[pid] = now
+        self._observe_passage(pid, snapshot)
+        await self._write_sighting(
+            cam_id=cam_id,
+            person_id=pid,
+            embedding=emb,
+            snapshot_path=snapshot,
+            similarity=score,
+            det_score=det_score,
+            ts=now,
+        )
         # 只上报事实；开门由 SmartCenter 决策。person.note 约定为云端 user_id
         self.bus.publish(
             BusMessage(
