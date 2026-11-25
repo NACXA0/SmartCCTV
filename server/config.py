@@ -177,6 +177,8 @@ class AppConfig(BaseModel):
     timezone: str = "Asia/Shanghai"
     data_dir: str = "data"
     models_dir: str = "models"
+    # false：本地开发时会话校验视为通过；true：必须有效 session。前端仍按生产标准走登录 UI。
+    is_prod: bool = False
     auth: AuthConfig = Field(default_factory=AuthConfig)
     cameras: list[CameraConfig] = Field(default_factory=list)
     rules: list[RuleConfig] = Field(default_factory=list)
@@ -210,6 +212,9 @@ class AppConfig(BaseModel):
             self.storage.secret_key = os.environ["SMARTCCTV_S3_SECRET"]
         if os.environ.get("SMARTCCTV_S3_ACCESS_KEY"):
             self.storage.access_key = os.environ["SMARTCCTV_S3_ACCESS_KEY"]
+        env_prod = os.environ.get("SMARTCCTV_IS_PROD")
+        if env_prod is not None:
+            self.is_prod = env_prod.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def validate_source(url: str) -> str:

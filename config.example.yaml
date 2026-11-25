@@ -6,6 +6,9 @@ port: 8300
 timezone: Asia/Shanghai
 data_dir: data
 models_dir: models
+# false：本地开发时后端会话校验视为通过；true：必须有效 session。
+# 前端仍按生产标准（登录页 / TOTP）；HMAC 内部口不因本开关绕过。
+is_prod: false
 
 auth:
   session_days: 7

@@ -63,9 +63,21 @@ def build_api(get_runtime) -> APIRouter:
         runtime = rt()
         token = request.cookies.get("session", "")
         session = runtime.auth.read_token(token)
-        if session is None:
-            raise HTTPException(401, "未登录")
-        return session
+        if session is not None:
+            return session
+        # 非生产：无会话也视为通过（与中间件一致）；HMAC 口不受此影响
+        if not runtime.config.is_prod:
+            from server.auth import Session
+
+            now = time.time()
+            return Session(sid="dev", ip=request.client.host if request.client else "dev", created=now, seen=now, version=0)
+        raise HTTPException(401, "未登录")
+
+    @api.get("/auth/mode")
+    async def auth_mode():
+        """供排查；前端不必据此隐藏登录。"""
+        runtime = rt()
+        return {"ok": True, "is_prod": bool(runtime.config.is_prod)}
 
     @api.post("/auth/login")
     async def login(body: LoginBody, request: Request, response: Response):
@@ -95,7 +107,7 @@ def build_api(get_runtime) -> APIRouter:
     @api.get("/auth/me")
     async def me(request: Request):
         session = require_user(request)
-        return {"ok": True, "ip": session.ip, "sid": session.sid}
+        return {"ok": True, "ip": session.ip, "sid": session.sid, "is_prod": rt().config.is_prod}
 
     @api.get("/system/health")
     async def health(request: Request):

@@ -14,6 +14,8 @@
 ./START.sh repair --yes    # uv + Python 3.14 + 依赖；可选构建前端
 uv run python scripts/download_models.py   # 可选：拉取 yolo26n / buffalo_l
 cp -n config.example.yaml config.yaml      # 填写摄像头 / 门禁 / 通知
+# config.yaml 中 is_prod: false → 本地开发时后端会话校验放行；前端仍走登录 UI
+# 上线改为 is_prod: true。HMAC 内部口不因本开关绕过。
 ./START.sh start
 ```
 

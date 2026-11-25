@@ -58,12 +58,19 @@ async def security_middleware(request: Request, call_next):
         return JSONResponse({"detail": "请求过于频繁"}, status_code=429)
     path = request.url.path
     public = path.startswith("/api/auth/") or path in {"/login", "/"} or path.startswith("/assets/")
-    # 总控 HMAC 口：免 cookie，路由内自校验签名
+    # 总控 HMAC 口：免 cookie，路由内自校验签名（开发态也不绕过）
     hmac_paths = path.startswith("/api/internal/") or path in {
         "/api/passages/start",
         "/api/passages/stop",
     } or path.startswith("/api/passages/by-command/")
-    if path.startswith("/api/") and not path.startswith("/api/auth/") and not hmac_paths and runtime:
+    # is_prod=false：会话校验视为通过；前端仍按生产标准展示登录
+    if (
+        path.startswith("/api/")
+        and not path.startswith("/api/auth/")
+        and not hmac_paths
+        and runtime
+        and runtime.config.is_prod
+    ):
         token = request.cookies.get("session", "")
         if runtime.auth.read_token(token) is None and path not in {"/api/auth/login"}:
             # MJPEG 与其它 API 统一要登录；静态除外

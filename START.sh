@@ -60,6 +60,17 @@ cmd_diagnose() {
   if [[ -n "$python_ver" ]]; then echo "[OK] python $python_ver"; else echo "[WARN] 未 pin Python 3.14，请先环境修复"; fi
   [[ -f "$ROOT/pyproject.toml" ]] && echo "[OK] pyproject.toml" || { echo "[FAIL] pyproject.toml"; fail=1; }
   [[ -f "$ROOT/config.yaml" || -f "$ROOT/config.example.yaml" ]] && echo "[OK] config" || { echo "[FAIL] config"; fail=1; }
+  if [[ -f "$ROOT/config.yaml" ]] || [[ -f "$ROOT/config.example.yaml" ]]; then
+    local prod_flag
+    prod_flag="$(uv run python -c "from pathlib import Path; from server.config import load_config; p=Path('config.yaml') if Path('config.yaml').exists() else Path('config.example.yaml'); print('true' if load_config(p).is_prod else 'false')" 2>/dev/null || echo "?")"
+    if [[ "$prod_flag" == "true" ]]; then
+      echo "[OK] is_prod=true（强制会话）"
+    elif [[ "$prod_flag" == "false" ]]; then
+      echo "[OK] is_prod=false（开发：会话校验放行，前端仍走登录）"
+    else
+      echo "[WARN] 无法读取 is_prod"
+    fi
+  fi
   echo "--- 磁盘 ---"
   df -h "$ROOT" | tail -1
   if [[ -f "$ROOT/models/yolo26n.pt" ]]; then echo "[OK] yolo26n.pt"; else echo "[WARN] 缺 models/yolo26n.pt（可观看，检测停用）"; fi
